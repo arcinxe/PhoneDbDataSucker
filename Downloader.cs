@@ -2,16 +2,19 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using HtmlAgilityPack;
 
-namespace PhoneDbDataSucker {
+namespace PhoneDbDataSucker.App {
     class Downloader {
         private static readonly Queue<Task> WaitingTasks = new Queue<Task>();
         private static readonly Dictionary<int, Task> RunningTasks = new Dictionary<int, Task>();
-        public static int MaxRunningTasks = 20; // vary this to dynamically throttle launching new tasks 
+        private static DateTime _startTime = DateTime.Now;
+        private static int _maxRunningTasks = 20;
         private static int _totalPages = 1;
         private static int _downloadedPages = 0;
 
@@ -24,7 +27,8 @@ namespace PhoneDbDataSucker {
         public static void GetPage(int firstDeviceNumber) {
             // Console.ForegroundColor = ConsoleColor.Yellow;
             Console.ResetColor();
-            System.Console.WriteLine($"\rpage-{(firstDeviceNumber):00000}.html started download" + new string(' ', 60));
+            var consoleMessage = $"\rstarted download  page-{(firstDeviceNumber):00000}.html";
+            System.Console.WriteLine(consoleMessage + new string(' ', Console.BufferWidth - consoleMessage.Length));
             UpdateConsole();
             if (!Directory.Exists("Output/Pages")) {
                 Directory.CreateDirectory("Output/Pages");
@@ -36,7 +40,8 @@ namespace PhoneDbDataSucker {
             File.WriteAllText($"Output/Pages/page-{(firstDeviceNumber):00000}.html", pageContent);
             File.Delete($"Output/Pages/page-{(firstDeviceNumber):00000}.temp");
             Console.ForegroundColor = ConsoleColor.Green;
-            System.Console.WriteLine($"\rpage-{(firstDeviceNumber):00000}.html downloaded" + new string(' ', 60));
+            consoleMessage = $"\rdownloaded        page-{(firstDeviceNumber):00000}.html";
+            System.Console.WriteLine(consoleMessage + new string(' ', Console.BufferWidth - consoleMessage.Length));
             Console.ResetColor();
             _downloadedPages++;
             UpdateConsole();
@@ -68,6 +73,8 @@ namespace PhoneDbDataSucker {
 
             _totalPages = (int) Math.Ceiling(((double) GetNumberOfDevices().Result / 29));
             _downloadedPages = 0;
+            _maxRunningTasks = 20;
+            _startTime = DateTime.Now;
 
             System.Console.WriteLine($"Total pages: {_totalPages}");
             for (int i = 0; i < _totalPages; i++) {
@@ -86,15 +93,77 @@ namespace PhoneDbDataSucker {
             }
         }
 
+        public static void DownloadAllDeviceSpecificationPages(string path) {
+            var tokenSource = new CancellationTokenSource();
+            var token = tokenSource.Token;
+            Worker.Done = new Worker.DoneDelegate(WorkerDone);
+            var file = File.ReadAllLines(path);
+            _totalPages = file.Count();
+            int count = 0;
+            _maxRunningTasks = 70;
+            _startTime = DateTime.Now;
+
+            foreach (var link in file) {
+                WaitingTasks.Enqueue(new Task(id => new Worker().DoWork((int) id, () => GetDeviceSpecificationPage(link), token), count, token));
+                count++;
+            }
+
+            LaunchTasks();
+            while (RunningTasks.Count != 0)
+                System.Threading.Thread.Sleep(500);
+
+            UpdateConsole();
+            if (RunningTasks.Count > 0) {
+                lock(WaitingTasks) WaitingTasks.Clear();
+                tokenSource.Cancel();
+            }
+        }
+
+        public static void GetDeviceSpecificationPage(string link) {
+            var name = link.Remove(0, 49);
+            var consoleMessage = "";
+
+            Console.ResetColor();
+            consoleMessage = $"\rstarted download  page-{name}.html";
+            System.Console.WriteLine(consoleMessage + new string(' ', Console.BufferWidth - consoleMessage.Length));
+            UpdateConsole();
+            if (!Directory.Exists("Output/Specifications")) {
+                Directory.CreateDirectory("Output/Specifications");
+            }
+            File.Create($"Output/Specifications/page-{name}.temp");
+            try {
+
+                var pageResponse = _client.GetAsync($"{link}&d=detailed_specs").Result;
+                pageResponse.EnsureSuccessStatusCode();
+                var pageContent = pageResponse.Content.ReadAsStringAsync().Result;
+                File.WriteAllText($"Output/Specifications/page-{name}.html", pageContent);
+                File.Delete($"Output/Specifications/page-{name}.temp");
+                Console.ForegroundColor = ConsoleColor.Green;
+                consoleMessage = $"\rdownloaded        page-{name}.html";
+                System.Console.WriteLine(consoleMessage + new string(' ', Console.BufferWidth - consoleMessage.Length));
+                Console.ResetColor();
+                _downloadedPages++;
+                UpdateConsole();
+            } catch (System.Exception e) {
+
+                File.Delete($"Output/Specifications/page-{name}.temp");
+                Console.ForegroundColor = ConsoleColor.Red;
+                consoleMessage = $"\rdownload failed   page-{name}.html failed";
+                System.Console.WriteLine(consoleMessage + new string(' ', Console.BufferWidth - consoleMessage.Length));
+                System.Console.WriteLine(e.Message);
+                File.AppendAllText("Output/FailedDeviceLinks.txt", $"{link}\n");
+            }
+        }
+
         /// <summary>
         /// Launches the enqueued tasks
         /// </summary>
         /// <returns></returns>
-        static async void LaunchTasks() {
+        private static async void LaunchTasks() {
             // keep checking until we're done
             while ((WaitingTasks.Count > 0) || (RunningTasks.Count > 0)) {
                 // launch tasks when there's room
-                while ((WaitingTasks.Count > 0) && (RunningTasks.Count < MaxRunningTasks)) {
+                while ((WaitingTasks.Count > 0) && (RunningTasks.Count < _maxRunningTasks)) {
                     Task task = WaitingTasks.Dequeue();
                     lock(RunningTasks) RunningTasks.Add((int) task.AsyncState, task);
                     task.Start();
@@ -105,12 +174,20 @@ namespace PhoneDbDataSucker {
             UpdateConsole(); // all done
         }
 
-        static void UpdateConsole() {
-            Console.Write($"\rProgress: {((double)_downloadedPages/_totalPages).ToString("P2", new NumberFormatInfo { PercentPositivePattern = 1, PercentNegativePattern = 1 })} [{_downloadedPages}/{_totalPages}], Waiting downloads: {WaitingTasks.Count:##0}  Running downloads: {RunningTasks.Count:##0} ");
+        private static void UpdateConsole() {
+
+            var consoleMessage = $"\rProgress: " +
+                $"{((double)_downloadedPages/_totalPages).ToString("P2", new NumberFormatInfo { PercentPositivePattern = 1, PercentNegativePattern = 1 })} " +
+                $"[{_downloadedPages}/{_totalPages}], Waiting downloads: {WaitingTasks.Count:##0}  Running downloads: {RunningTasks.Count:##0}, " +
+                $"Elapsed time: {(DateTime.Now-_startTime):hh\\h\\:mm\\m\\:ss\\s}";
+            System.Console.Write(consoleMessage + new string(' ', Console.BufferWidth - consoleMessage.Length));
         }
 
-        // callback from finished worker
-        static void WorkerDone(int id) {
+        /// <summary>
+        /// Callback from finished worker
+        /// </summary>
+        /// <param name="id">Id of task to remove</param>
+        private static void WorkerDone(int id) {
             lock(RunningTasks) RunningTasks.Remove(id);
         }
     }
