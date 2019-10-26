@@ -13,7 +13,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\PhonedbDataSucker\PhoneDbDataSucker.csproj" />
+    <ProjectReference Include="..\PhoneDbDataSucker.App\PhoneDbDataSucker.App.csproj" />
   </ItemGroup>
 
 </Project>
